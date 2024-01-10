@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 import threading
 from pathlib import Path
@@ -7,7 +8,7 @@ from typing import Optional
 import fire  # type: ignore
 
 from . import frida_exec, winlicense2, winlicense3
-from .dump_utils import dump_dotnet_assembly, interpreter_can_dump_pe, probe_text_sections
+from .dump_utils import dump_dotnet_assembly, dump_pe, get_section_ranges, interpreter_can_dump_pe, probe_text_sections
 from .logger import setup_logger
 from .version_detection import detect_winlicense_version
 
@@ -24,6 +25,7 @@ def run_unlicense(
     pe_to_dump: str,
     verbose: bool = False,
     pause_on_oep: bool = False,
+    no_imports: bool = False,
     force_oep: Optional[int] = None,
     target_version: Optional[int] = None,
     timeout: int = 10,
@@ -32,6 +34,9 @@ def run_unlicense(
     Unpack executables protected with Themida/WinLicense 2.x and 3.x
     """
     setup_logger(LOG, verbose)
+
+    # Make sure child processes won't try to run as administrator
+    _force_run_as_invoker()
 
     pe_path = Path(pe_to_dump)
     if not pe_path.is_file():
@@ -55,6 +60,7 @@ def run_unlicense(
                   "This is most likely a 32 vs 64 bit mismatch.")
         sys.exit(3)
 
+    section_ranges = get_section_ranges(pe_to_dump)
     text_section_ranges = probe_text_sections(pe_to_dump)
     if text_section_ranges is None:
         LOG.error("Failed to automatically detect .text section")
@@ -92,18 +98,34 @@ def run_unlicense(
             dumped_oep = dumped_image_base + force_oep
             LOG.info("Using given OEP RVA value instead (%s)", hex(force_oep))
 
+        # Pick the range that contains the OEP
+        text_section_range = text_section_ranges[0]
+        for range in text_section_ranges:
+            if range.contains(dumped_oep - dumped_image_base):
+                text_section_range = range
+
         # .NET assembly dumping works the same way regardless of the version
         if is_dotnet:
             LOG.info("Dumping .NET assembly ...")
             if not dump_dotnet_assembly(process_controller, dumped_image_base):
                 LOG.error(".NET assembly dump failed")
+        # Do not bother recovering imports and start dumping if requested
+        elif no_imports:
+            dump_pe(process_controller, pe_to_dump, dumped_image_base,
+                    dumped_oep, 0, 0, True)
         # Fix imports and dump the executable
         elif target_version == 2:
             winlicense2.fix_and_dump_pe(process_controller, pe_to_dump,
-                                        dumped_image_base, dumped_oep)
+                                        dumped_image_base, dumped_oep,
+                                        text_section_range)
         elif target_version == 3:
             winlicense3.fix_and_dump_pe(process_controller, pe_to_dump,
-                                        dumped_image_base, dumped_oep)
+                                        dumped_image_base, dumped_oep,
+                                        section_ranges, text_section_range)
     finally:
         # Try to kill the process on exit
         process_controller.terminate_process()
+
+
+def _force_run_as_invoker() -> None:
+    os.environ["__COMPAT_LAYER"] = "RUNASINVOKER"

@@ -2,11 +2,23 @@
 
 ## [Unreleased]
 ### Fixed
+- Improve reliability of DLL unpacking
+
+## [0.4.0] - 2023-08-14
+### Added
+- Add a `--no_imports` option that allows dumping PEs at the original entry point without fixing imports
+
+### Fixed
 - Fix a potential deadlock when dumping DLLs
+- Improve version detection for Themida/Winlicense 2.x
 - Improve version detection for Themida/Winlicense 3.x
 - Improve .text section detection for Themida/Winlicense 3.x
 - Fix `lief.not_found` exception happening when dumping certain MinGW EXEs
 - Fix TLS callback detection for some 32-bit EXEs
+- Handle wrapped imports from Themida/Winlicense 3.1.4.0
+- Improve IAT search algorithm for Themida/Winlicense 3.x
+- Allow unpacking EXEs that require admin privilege at medium integrity level
+- Properly skip DllMain invocations on thread creation/deletion when dumping DLLs
 
 ### Changed
 - Silence some misleading "error" logs that were emitted

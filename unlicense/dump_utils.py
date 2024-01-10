@@ -2,6 +2,7 @@ import gc
 import logging
 import os
 import platform
+import shutil
 import struct
 from tempfile import TemporaryDirectory
 from typing import List, Optional
@@ -16,6 +17,21 @@ from .process_control import MemoryRange, ProcessController
 LOG = logging.getLogger(__name__)
 
 
+def get_section_ranges(pe_file_path: str) -> List[MemoryRange]:
+    section_ranges: List[MemoryRange] = []
+    binary = lief.PE.parse(pe_file_path)
+    if binary is None:
+        LOG.error("Failed to parse PE '%s'", pe_file_path)
+        return section_ranges
+
+    for section in lief_pe_sections(binary):
+        section_ranges += [
+            MemoryRange(section.virtual_address, section.virtual_size, "r--")
+        ]
+
+    return section_ranges
+
+
 def probe_text_sections(pe_file_path: str) -> Optional[List[MemoryRange]]:
     text_sections = []
     binary = lief.PE.parse(pe_file_path)
@@ -23,13 +39,16 @@ def probe_text_sections(pe_file_path: str) -> Optional[List[MemoryRange]]:
         LOG.error("Failed to parse PE '%s'", pe_file_path)
         return None
 
-    # Find the potential text sections (i.e., executable sections with "empty"
-    # names or named '.text')
+    # Find the potential original text sections (i.e., executable sections with
+    # "empty" names or named '.text*').
+    # Note(ergrelet): we thus do not want to include Themida/WinLicense's
+    # sections in that list.
     for section in lief_pe_sections(binary):
         section_name = section.fullname
         stripped_section_name = section_name.replace(' ',
                                                      '').replace('\00', '')
-        if len(stripped_section_name) > 0 and section_name != ".text":
+        if len(stripped_section_name) > 0 and \
+                stripped_section_name not in [".text", ".textbss", ".textidx"]:
             break
 
         if section.has_characteristic(
@@ -60,32 +79,33 @@ def dump_pe(
     gc.collect()
 
     with TemporaryDirectory() as tmp_dir:
-        TMP_FILE_PATH = os.path.join(tmp_dir, "unlicense.tmp")
+        TMP_FILE_PATH1 = os.path.join(tmp_dir, "unlicense.tmp2")
+        TMP_FILE_PATH2 = os.path.join(tmp_dir, "unlicense.tmp2")
         try:
             pyscylla.dump_pe(process_controller.pid, image_base, oep,
-                             TMP_FILE_PATH, pe_file_path)
+                             TMP_FILE_PATH1, pe_file_path)
         except pyscylla.ScyllaException as scylla_exception:
             LOG.error("Failed to dump PE: %s", str(scylla_exception))
             return False
 
         LOG.info("Fixing dump ...")
-        output_file_name = f"unpacked_{process_controller.main_module_name}"
         try:
             pyscylla.fix_iat(process_controller.pid, image_base, iat_addr,
-                             iat_size, add_new_iat, TMP_FILE_PATH,
-                             output_file_name)
+                             iat_size, add_new_iat, TMP_FILE_PATH1,
+                             TMP_FILE_PATH2)
         except pyscylla.ScyllaException as scylla_exception:
             LOG.error("Failed to fix IAT: %s", str(scylla_exception))
             return False
 
         try:
-            pyscylla.rebuild_pe(output_file_name, False, True, False)
+            pyscylla.rebuild_pe(TMP_FILE_PATH2, False, True, False)
         except pyscylla.ScyllaException as scylla_exception:
             LOG.error("Failed to rebuild PE: %s", str(scylla_exception))
             return False
 
         LOG.info("Rebuilding PE ...")
-        _rebuild_pe(output_file_name)
+        output_file_name = f"unpacked_{process_controller.main_module_name}"
+        _fix_pe(TMP_FILE_PATH2, output_file_name)
 
         LOG.info("Output file has been saved at '%s'", output_file_name)
 
@@ -109,7 +129,14 @@ def dump_dotnet_assembly(
     return True
 
 
-def _rebuild_pe(pe_file_path: str) -> None:
+def _fix_pe(pe_file_path: str, output_file_path: str) -> None:
+    with TemporaryDirectory() as tmp_dir:
+        TMP_FILE_PATH = os.path.join(tmp_dir, "unlicense.tmp")
+        _rebuild_pe(pe_file_path, TMP_FILE_PATH)
+        _resize_pe(TMP_FILE_PATH, output_file_path)
+
+
+def _rebuild_pe(pe_file_path: str, output_file_path: str) -> None:
     binary = lief.PE.parse(pe_file_path)
     if binary is None:
         LOG.error("Failed to parse PE '%s'", pe_file_path)
@@ -127,23 +154,7 @@ def _rebuild_pe(pe_file_path: str) -> None:
     builder.build_dos_stub(True)
     builder.build_overlay(True)
     builder.build()
-    builder.write(pe_file_path)
-
-    number_of_sections = len(binary.sections)
-    if number_of_sections == 0:
-        # Shouldn't happen but hey
-        return
-
-    # Determine the actual PE raw size
-    highest_section = binary.sections[0]
-    for section in lief_pe_sections(binary):
-        if section.offset > highest_section.offset:
-            highest_section = section
-    pe_size = highest_section.offset + highest_section.size
-
-    # Truncate file
-    with open(pe_file_path, "ab") as pe_file:
-        pe_file.truncate(pe_size)
+    builder.write(output_file_path)
 
 
 def _resolve_section_names(binary: lief.PE.Binary) -> None:
@@ -160,6 +171,43 @@ def _resolve_section_names(binary: lief.PE.Binary) -> None:
             LOG.debug(".text section found (RVA=%s)",
                       hex(section.virtual_address))
             section.name = ".text"
+
+
+def _resize_pe(pe_file_path: str, output_file_path: str) -> None:
+    pe_size = _get_pe_size(pe_file_path)
+    if pe_size is None:
+        return None
+
+    # Copy file
+    shutil.copy(pe_file_path, output_file_path)
+    # Truncate file
+    with open(output_file_path, "ab") as pe_file:
+        pe_file.truncate(pe_size)
+
+
+def _get_pe_size(pe_file_path: str) -> Optional[int]:
+    binary = lief.PE.parse(pe_file_path)
+    if binary is None:
+        LOG.error("Failed to parse PE '%s'", pe_file_path)
+        return None
+
+    number_of_sections = len(binary.sections)
+    if number_of_sections == 0:
+        # Shouldn't happen but hey
+        return None
+
+    # Determine the actual PE raw size
+    highest_section = binary.sections[0]
+    for section in lief_pe_sections(binary):
+        # Select section with the highest offset
+        if section.offset > highest_section.offset:
+            highest_section = section
+        # If sections have the same offset, select the one with the biggest size
+        elif section.offset == highest_section.offset and section.size > highest_section.size:
+            highest_section = section
+    pe_size = highest_section.offset + highest_section.size
+
+    return pe_size
 
 
 def pointer_size_to_fmt(pointer_size: int) -> str:
